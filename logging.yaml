@@ -1,0 +1,31 @@
+version: 1
+formatters:
+  default:
+    format: '[%(asctime)s - %(name)s - %(levelname)s] %(message)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: default
+    stream: ext://sys.stdout
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: default
+    filename: voter.log
+    maxBytes: 5242880
+    backupCount: 5
+    encoding: utf-8
+loggers:
+  voter:
+    level: DEBUG
+    handlers:
+      - console
+      - file
+    propagate: false
+root:
+  level: DEBUG
+  handlers:
+    - console
+    - file
