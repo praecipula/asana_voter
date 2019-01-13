@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import yaml
 import json
 import logging
@@ -7,6 +8,7 @@ import logging.config
 import argparse
 import asana
 import itertools
+import random
 
 
 with open('logging.yaml') as fobj:
@@ -182,6 +184,15 @@ class SourceProject(AsanaProject):
             self._source_tasks = [SourceTask(task_json['id']) for task_json in task_generator]
         return self._source_tasks
 
+    
+    def combinations(self):
+        # Ensure metatask is popped; see TODO in source project#tasks
+        mt = self.meta_task()
+        """Generate all combos of tasks"""
+        combos = [p for p in itertools.combinations([str(t.id) for t in self.tasks], 2)]
+        logger.info(combos)
+        return combos
+
     @property
     def voters(self):
         return [Voter(follower_json['id']) for follower_json in self._get_json()['followers']]
@@ -194,12 +205,63 @@ class SourceProject(AsanaProject):
         return f"Project {self.name} ({self.id})"
 
 class DestTask(AsanaObj):
-    @classmethod
-    def create(klass, source_task_one, source_task_two):
-        pass
 
-    def __init__(self):
-        super(DestTask, self).__init__(project_id)
+    EXT_ID_REGEX = re.compile(r"""voting_task_
+    (?P<dest_project_id>\d+)_
+    (?P<first_task_id>\d+)_
+    (?P<second_task_id>\d+)""", re.X)
+
+    @classmethod
+    def create(klass, dest_project, source_task_one, source_task_two):
+        # Sort lexicographically by source task index
+        if source_task_one.id == source_task_two.id:
+            raise "Task IDs must be different"
+        ordered_tasks = [source_task_one, source_task_two]
+        ordered_tasks.sort(key=lambda t: t.id)
+        random_tasks = ordered_tasks[:]
+        random.shuffle(random_tasks)
+        logger.info(f"Creating new dest task from {source_task_one} and {source_task_two}")
+        dest_task = client.tasks.create({"name": f"Vote: {random_tasks[0].name} vs {random_tasks[1].name}",
+            "external": {
+                "id": f"voting_task_{dest_project.id}_{ordered_tasks[0].id}_{ordered_tasks[1].id}"
+                },
+            "projects": [dest_project.id]
+            })
+        return DestTask(dest_task['id'], source_task_one, source_task_two)
+
+    def __init__(self, task_id, source_task_one = None, source_task_two = None):
+        super(DestTask, self).__init__(task_id)
+        # If given, these are set
+        # If not, they can be looked up from the external field.
+        self._source_task_one = source_task_one
+        self._source_task_two = source_task_two
+
+    def _asana_request(self):
+        return client.tasks.find_by_id(self._obj_id, fields=['name', 'external'])
+
+    @property
+    def first_source_task(self):
+        if not self._source_task_one:
+            logger.info(f"Looking up source task one from external ID")
+            data = self._get_json()
+            if 'external' not in data:
+                return None
+            task_data = DestTask.EXT_ID_REGEX.match(data['external']['id'])
+            self._source_task_one = SourceTask(task_data['first_task_id'])
+        return self._source_task_one
+
+    @property
+    def second_source_task(self):
+        if not self._source_task_two:
+            logger.info(f"Looking up source task two from external ID")
+            data = self._get_json()
+            if 'external' not in data:
+                return None
+            task_data = DestTask.EXT_ID_REGEX.match(data['external']['id'])
+            self._source_task_two = SourceTask(task_data['second_task_id'])
+        return self._source_task_two
+
+
 
 
 class DestProject(AsanaProject):
@@ -215,6 +277,8 @@ class DestProject(AsanaProject):
     def __init__(self, project_id, voter):
         super(DestProject, self).__init__(project_id)
         self._voter = voter
+        self._voting_task_index = None
+        self._dest_tasks = None
 
     def _asana_request(self):
         return client.projects.find_by_id(self._obj_id, fields=['name', 'followers', 'team', 'workspace'])
@@ -224,19 +288,32 @@ class DestProject(AsanaProject):
         return self._voter
 
     def current_voting_tasks(self):
-        """Find (memoized) all the current voting tasks."""
-        pass
+        """Find (memoized) all the current voting tasks.
+        Also denormalizes into a map of combinations.
+        """
+        if not self._dest_tasks:
+            self._voting_task_index = {}
+            task_generator = client.tasks.find_by_project(self._obj_id, fields=['name'])
+            self._dest_tasks = [DestTask(task_json['id']) for task_json in task_generator]
+            for dtask in self._dest_tasks:
+                if dtask.first_source_task.id not in self._voting_task_index:
+                    self._voting_task_index[dtask.first_source_task.id] = {}
+                if dtask.second_source_task.id not in self._voting_task_index[dtask.first_source_task.id]:
+                    self._voting_task_index[dtask.first_source_task.id][dtask.second_source_task.id] = dtask
+        return self._dest_tasks
 
-    def find_voting_task_by_task_ids(self, id_one, id_two):
+
+    def find_voting_task_by_source_tasks(self, source_task_one, source_task_two):
         """Search the voting tasks for the one with the indices given, or None if does not exist."""
-        pass
-
-    def combinations(self, source_project):
-        # Ensure metatask is popped; see TODO in source project#tasks
-        mt = source_project.meta_task()
-        """Generate all combos of tasks"""
-        combos = [p for p in itertools.combinations([t.id for t in source_project.tasks], 2)]
-        logger.info(combos)
+        # Ensure the index is built
+        self.current_voting_tasks()
+        ordered_tasks = [source_task_one, source_task_two]
+        ordered_tasks.sort(key=lambda t: t.id)
+        if ordered_tasks[0].id not in self._voting_task_index:
+            return None
+        if ordered_tasks[1].id not in self._voting_task_index[ordered_tasks[0].id]:
+            return None
+        return self._voting_task_index[ordered_tasks[0].id][ordered_tasks[1].id]
 
     def __str__(self):
         return f"Dest project {self.name} ({self.id}) for {self.voter}"
@@ -280,4 +357,10 @@ if __name__ == '__main__':
             logger.info(f"Voting project for {v}: {dest}")
 
         logger.info(f"Projects {[str(d) for d in dest_projects]}")
+        source_project_task_combos = p.combinations()
+        for dest_proj in dest_projects:
+            for combo in source_project_task_combos:
+                dest_task = dest_proj.find_voting_task_by_source_tasks(SourceTask(combo[0]), SourceTask(combo[1]))
+                if not dest_task:
+                    dest_task = DestTask.create(dest_proj, SourceTask(combo[0]), SourceTask(combo[1]))
 
